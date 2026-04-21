@@ -44,15 +44,22 @@ MAX_TRADES           = 5       # max concurrent open positions
 PARTIAL_CLOSE_AT_1R  = True    # close 50 % at 1×ATR profit
 MAGIC                = 31337   # unique identifier for bot's orders
 
-# Best symbols to trade (high volatility + tight spread on XM)
-WATCHLIST = [
+# Forex pairs (always available on XM)
+FOREX_PAIRS = [
     "EURUSD", "GBPUSD", "USDJPY", "USDCHF",
     "AUDUSD", "USDCAD", "NZDUSD", "EURJPY", "GBPJPY",
-    "XAUUSD",   # Gold
-    "US30",     # Dow Jones
-    "USTEC",    # Nasdaq
-    "USOIL",    # Crude Oil
+    "EURGBP", "AUDJPY", "GBPJPY", "CHFJPY",
 ]
+
+# XM uses different names depending on server — all variants listed, bot picks whichever works
+SYMBOL_VARIANTS = {
+    "GOLD":   ["XAUUSD", "XAUUSDm", "GOLD", "XAUUSD."],
+    "DOW":    ["US30", "DJ30", "WS30", "US30Cash", "DJIA", "USA30"],
+    "NASDAQ": ["USTEC", "NAS100", "NASDAQ", "US100", "USTEC100", "USA100"],
+    "OIL":    ["USOIL", "OIL", "WTIUSD", "USOIL.", "CrudOil", "USOil"],
+    "SP500":  ["US500", "SP500", "USA500", "S&P500", "SPX500"],
+    "SILVER": ["XAGUSD", "SILVER", "XAGUSDm"],
+}
 
 SCAN_SECS   = 20   # scan every 20 s
 ENTRY_TF    = mt5.TIMEFRAME_M5
@@ -510,14 +517,40 @@ def init() -> bool:
     log.info(f"✅ Connected  account={info.login}  balance=${info.balance:.2f}  leverage=1:{info.leverage}")
     return True
 
-def enable_symbols(wl: list) -> list:
+def resolve_symbol_variants() -> list:
+    """Try every variant name per instrument, pick first one that works on this XM server."""
+    found = []
+    for instrument, variants in SYMBOL_VARIANTS.items():
+        for name in variants:
+            if mt5.symbol_select(name, True):
+                info = mt5.symbol_info(name)
+                if info is not None:
+                    found.append(name)
+                    log.info(f"  [AUTO] {instrument:8s} -> {name}")
+                    break
+        else:
+            log.warning(f"  [AUTO] {instrument:8s} -> NOT FOUND on this server (skipped)")
+    return found
+
+
+def enable_symbols(base: list) -> list:
+    """Enable forex pairs + auto-resolve commodity/index symbols."""
     ok = []
-    for s in wl:
+
+    # Standard forex — always available
+    for s in base:
         if mt5.symbol_select(s, True):
             ok.append(s)
         else:
-            log.warning(f"Symbol unavailable: {s}")
-    log.info(f"Active watchlist ({len(ok)}): {ok}")
+            log.warning(f"Symbol not available: {s}")
+
+    # Auto-discover Gold, Indices, Oil etc.
+    log.info("Auto-detecting commodity/index symbols on this XM server...")
+    extras = resolve_symbol_variants()
+    ok.extend(extras)
+
+    ok = list(dict.fromkeys(ok))   # deduplicate, preserve order
+    log.info(f"Final watchlist ({len(ok)}): {ok}")
     return ok
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -528,7 +561,7 @@ def run():
     if not init():
         return
 
-    symbols = enable_symbols(WATCHLIST)
+    symbols = enable_symbols(FOREX_PAIRS)
     if not symbols:
         log.error("No tradable symbols found.")
         mt5.shutdown(); return
