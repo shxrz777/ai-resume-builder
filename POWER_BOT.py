@@ -32,20 +32,23 @@ TARGET_BALANCE  = 500.0
 MAX_DD_PCT      = 0.40    # 40 % drawdown  → kill switch
 DAILY_LOSS_PCT  = 0.25    # 25 % session loss → pause 4 h
 RISK_PCT        = 0.20    # 20 % per trade (aggressive demo)
-MAX_TRADES      = 6
+MAX_TRADES      = 8
 MAGIC           = 55555
-SCAN_SECS       = 5       # scan every 5 seconds
+SCAN_SECS       = 2       # scan every 2 seconds
 
 # Scalp settings
-SL_PIPS         = 8       # stop loss in pips
-TP_PIPS         = 16      # take profit in pips (2:1 R:R)
-MAX_SPREAD_PIPS = 3.0     # skip if spread > 3 pips
-TICK_WINDOW_SEC = 30      # look back 30 s of ticks for momentum
+SL_PIPS         = 6       # stop loss in pips
+TP_PIPS         = 12      # take profit in pips (2:1 R:R)
+MAX_SPREAD_PIPS = 4.0     # skip if spread > 4 pips
+TICK_WINDOW_SEC = 15      # look back 15 s of ticks for momentum
+COOLDOWN_SECS   = 20      # seconds before re-entering same symbol
 
 # Only the most liquid pairs — tight spreads, high tick volume
 SCALP_SYMBOLS = [
     "EURUSD", "GBPUSD", "USDJPY", "USDCHF",
     "AUDUSD", "USDCAD", "NZDUSD", "EURJPY", "GBPJPY",
+    "EURGBP", "AUDJPY", "CADJPY", "CHFJPY", "EURCAD",
+    "GBPCAD", "GBPAUD", "NZDCAD", "AUDCAD", "AUDNZD",
 ]
 
 SYMBOL_VARIANTS = {
@@ -188,73 +191,78 @@ def spread_ok(symbol: str) -> bool:
 #  SIGNAL ENGINE  — 3 fast signals, need 2/3
 # ══════════════════════════════════════════════════════════════════════════════
 
+_last_trade: dict = {}   # cooldown tracker per symbol
+
+
 def signal_score(symbol: str) -> int:
     """
-    Returns +1 (BUY) / -1 (SELL) / 0 (skip).
-    Uses 5-second tick bars + M1 trend.
-    Fires on 2 out of 3 signals.
+    Fires on ANY of these conditions (highest frequency mode):
+      A) EMA 3 just crossed EMA 8 (crossover on 5s bars)
+      B) EMA 3 position vs EMA 8 + RSI extreme (<40 or >60)
+      C) Tick momentum alone (strong flow)
+    No trend filter. No multi-confirmation required.
     """
-    # ── 1. Spread filter ──────────────────────────────────────────────────
+    # ── Cooldown guard ─────────────────────────────────────────────────────
+    if time.time() - _last_trade.get(symbol, 0) < COOLDOWN_SECS:
+        return 0
+
+    # ── Spread filter ──────────────────────────────────────────────────────
     if not spread_ok(symbol):
         return 0
 
-    # ── Get 5s bars ───────────────────────────────────────────────────────
-    bars5 = get_tick_bars(symbol, seconds_back=150)
+    # ── 5-second bars ─────────────────────────────────────────────────────
+    bars5 = get_tick_bars(symbol, seconds_back=120)
     if bars5 is None:
-        return 0
+        # fallback: use tick momentum alone
+        sig_c = tick_momentum(symbol)
+        if sig_c != 0:
+            log.info(f"  SIGNAL [{symbol:10s}] {'BUY ' if sig_c==1 else 'SELL'} (tick-only)")
+        return sig_c
 
     close5 = bars5["close"]
+    e3     = ema(close5, 3)
+    e8     = ema(close5, 8)
+    rsi_v  = rsi(close5, 7).iloc[-1]
+    sig_c  = tick_momentum(symbol)
 
-    # ── Signal A : EMA 3/8 crossover on 5s bars ───────────────────────────
-    e3 = ema(close5, 3)
-    e8 = ema(close5, 8)
-    sig_a = 0
-    if e3.iloc[-1] > e8.iloc[-1] and e3.iloc[-2] <= e8.iloc[-2]:
-        sig_a = 1
-    elif e3.iloc[-1] < e8.iloc[-1] and e3.iloc[-2] >= e8.iloc[-2]:
-        sig_a = -1
+    e3_now  = e3.iloc[-1]; e3_prev = e3.iloc[-2]
+    e8_now  = e8.iloc[-1]; e8_prev = e8.iloc[-2]
 
-    # ── Signal B : RSI(7) extremes on 5s bars ─────────────────────────────
-    rsi7  = rsi(close5, 7)
-    rsi_v = rsi7.iloc[-1]
-    sig_b = 0
-    if rsi_v < 35:
-        sig_b = 1
-    elif rsi_v > 65:
-        sig_b = -1
+    # ── Condition A : fresh EMA crossover ─────────────────────────────────
+    cross_up   = e3_prev <= e8_prev and e3_now > e8_now
+    cross_down = e3_prev >= e8_prev and e3_now < e8_now
 
-    # ── Signal C : Tick momentum ───────────────────────────────────────────
-    sig_c = tick_momentum(symbol)
+    # ── Condition B : EMA position + RSI extreme ──────────────────────────
+    ema_bull = e3_now > e8_now and rsi_v < 42
+    ema_bear = e3_now < e8_now and rsi_v > 58
 
-    # ── M1 trend filter ────────────────────────────────────────────────────
-    df_m1 = get_m1_bars(symbol, 60)
-    trend = 0
-    if df_m1 is not None:
-        e20 = ema(df_m1["close"], 20).iloc[-1]
-        e50 = ema(df_m1["close"], 50).iloc[-1]
-        trend = 1 if e20 > e50 else -1
+    # ── Condition C : strong tick momentum ────────────────────────────────
+    # already computed above
 
-    # ── Consensus: need 2 of 3 agreeing ───────────────────────────────────
-    votes = [sig_a, sig_b, sig_c]
-    bull  = sum(1 for v in votes if v ==  1)
-    bear  = sum(1 for v in votes if v == -1)
-
-    signal = 0
-    if bull >= 2:
+    # ── Decision (any single condition fires) ─────────────────────────────
+    if cross_up or ema_bull or sig_c == 1:
         signal = 1
-    elif bear >= 2:
+    elif cross_down or ema_bear or sig_c == -1:
         signal = -1
+    else:
+        signal = 0
 
-    # Allow counter-trend only if all 3 agree; otherwise follow trend
-    if signal != 0 and trend != 0:
-        if signal != trend and (bull < 3 and bear < 3):
-            signal = 0
+    # Require at least 2 conditions true to avoid noise
+    buy_conditions  = int(cross_up) + int(ema_bull) + int(sig_c == 1)
+    sell_conditions = int(cross_down) + int(ema_bear) + int(sig_c == -1)
+
+    if buy_conditions >= 2:
+        signal = 1
+    elif sell_conditions >= 2:
+        signal = -1
+    else:
+        signal = 0
 
     if signal != 0:
-        direction = "BUY " if signal == 1 else "SELL"
-        log.info(f"  SIGNAL [{symbol:10s}] {direction}  "
-                 f"A={sig_a:+d} B={sig_b:+d} C={sig_c:+d}  "
-                 f"rsi={rsi_v:.0f}  trend={'UP' if trend==1 else 'DN' if trend==-1 else '??'}")
+        log.info(f"  SIGNAL [{symbol:10s}] {'BUY ' if signal==1 else 'SELL'} "
+                 f"cross={int(cross_up or cross_down)} "
+                 f"ema_rsi={int(ema_bull or ema_bear)} "
+                 f"ticks={sig_c:+d}  rsi={rsi_v:.0f}")
     return signal
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -327,6 +335,7 @@ def open_trade(symbol: str, direction: int, balance: float) -> bool:
             side = "BUY " if direction == 1 else "SELL"
             log.info(f"  ✅ OPENED [{symbol}] {side} {lot} lots  "
                      f"@ {price}  SL={sl}  TP={tp}  ticket={r.order}")
+            _last_trade[symbol] = time.time()
             return True
 
     log.warning(f"  ❌ Order failed [{symbol}]: {mt5.last_error()}")
@@ -445,13 +454,12 @@ def run():
 
     print(f"""
 +=========================================================+
-|        XM ULTRA SCALPER BOT  —  5s TICK BARS           |
-|  Start  : ${start_bal:.2f}      Target : ${TARGET_BALANCE:.2f}         |
-|  SL     : {SL_PIPS} pips          TP : {TP_PIPS} pips              |
-|  Risk   : {RISK_PCT*100:.0f}%/trade       Max : {MAX_TRADES} concurrent   |
-|  Signal : 2/3 (EMA·RSI·TickFlow)                       |
-|  Scan   : every {SCAN_SECS}s                                  |
-|  Press Ctrl+C to stop safely                           |
+|      XM ULTRA SCALPER  -  HIGH FREQUENCY MODE          |
+|  Start  : ${start_bal:.2f}    Target : ${TARGET_BALANCE:.2f}            |
+|  SL={SL_PIPS}pip  TP={TP_PIPS}pip  Risk={RISK_PCT*100:.0f}%  Max={MAX_TRADES} trades     |
+|  Symbols: {len(symbols):2d}   Scan: every {SCAN_SECS}s   CD: {COOLDOWN_SECS}s/symbol   |
+|  Signal : 2/3 conditions (EMA cross/pos + RSI + Ticks) |
+|  Ctrl+C to stop                                        |
 +=========================================================+""")
 
     try:
